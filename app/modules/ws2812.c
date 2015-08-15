@@ -1,3 +1,4 @@
+#include <malloc.h>
 #include "lualib.h"
 #include "lauxlib.h"
 #include "platform.h"
@@ -6,6 +7,9 @@
 #include "c_stdlib.h"
 #include "c_string.h"
 #include "user_interface.h"
+
+static uint8_t *led_buffer = NULL;
+static size_t led_buffer_length = 0;
 
 static inline uint32_t _getCycleCount(void) {
   uint32_t cycles;
@@ -24,6 +28,8 @@ static inline uint32_t _getCycleCount(void) {
 static void ICACHE_RAM_ATTR ws2812_write(uint8_t pin, uint8_t *pixels, uint32_t length) {
   uint8_t *p, *end, pixel, mask;
   uint32_t t, t0h, t1h, ttot, c, start_time, pin_mask;
+
+  WRITE_PERI_REG(0x60000914, 0x73); //reset watchdog
 
   pin_mask = 1 << pin;
   p =  pixels;
@@ -54,6 +60,7 @@ static void ICACHE_RAM_ATTR ws2812_write(uint8_t pin, uint8_t *pixels, uint32_t 
       mask = 0x80;
     }
   }
+  WRITE_PERI_REG(0x60000914, 0x73); //reset watchdog
 }
 
 // Lua: ws2812.writergb(pin, "string")
@@ -127,12 +134,152 @@ static int ICACHE_FLASH_ATTR ws2812_writegrb(lua_State* L) {
   return 0;
 }
 
+// ws2812_move_right
+//  move the whole data x leds to the right
+static int ICACHE_FLASH_ATTR ws2812_move_right(lua_State *L)
+{
+  const size_t led_amount = luaL_checkinteger(L, 1);
+
+  if(led_amount < 0)
+  {
+      return -1;
+  }
+
+  memmove(led_buffer + led_amount*3, led_buffer, led_buffer_length - led_amount*3);
+  memset(led_buffer, 0, led_amount*3);
+
+  return 0;
+}
+
+
+// ws2812_move_left
+//  move the whole data x leds to the left
+static int ICACHE_FLASH_ATTR ws2812_move_left(lua_State *L)
+{
+  const size_t led_amount = luaL_checkinteger(L, 1);
+
+  if(led_amount < 0)
+  {
+      return -1;
+  }
+
+  memmove(led_buffer, led_buffer + led_amount*3, led_buffer_length - led_amount*3);
+  memset(led_buffer + led_buffer_length - led_amount*3, 0, led_amount*3);
+
+  return 0;
+}
+
+
+// ws2812_set_leds
+//  updates the internal led_buffer at the given position
+//  the parameter at 2nd position is a string which is copyed into the internal led_buffer
+//  usefull to update more than one led
+static int ICACHE_FLASH_ATTR ws2812_set_leds(lua_State *L)
+{
+  const size_t led_pos = luaL_checkinteger(L, 1);
+  size_t length;
+  const char *rgb = luaL_checklstring(L, 2, &length);
+
+  if(led_pos >= led_buffer_length)
+  {
+      return -1;
+  }
+  if(led_pos < 0)
+  {
+      return -1;
+  }
+
+  // cutof the string if we reach the end of the buffer
+  if(length + led_pos > led_buffer_length)
+  {
+      length = led_buffer_length - led_pos;
+  }
+
+  memcpy(led_buffer + led_pos*3, rgb, length);
+
+  return 0;
+}
+
+// ws2812_set_led
+//  updates the internal led_buffer at the given position
+static int ICACHE_FLASH_ATTR ws2812_set_led(lua_State *L)
+{
+  const size_t led = luaL_checkinteger(L, 1);
+
+  if(led >= led_buffer_length)
+  {
+      return -1;
+  }
+  if(led < 0)
+  {
+      return -1;
+  }
+
+  const uint8_t red = luaL_checkinteger(L, 2);
+  const uint8_t green = luaL_checkinteger(L, 3);
+  const uint8_t blue = luaL_checkinteger(L, 4);
+
+  led_buffer[led*3+0] = green;
+  led_buffer[led*3+1] = red;
+  led_buffer[led*3+2] = blue;
+
+  return 0;
+}
+
+// ws2812_write_buffer
+//  writes out the internal led_buffer to the pin parsed as first parameter
+static int ICACHE_FLASH_ATTR ws2812_write_buffer(lua_State *L)
+{
+  const uint8_t pin = luaL_checkinteger(L, 1);
+
+  // Initialize the output pin
+  platform_gpio_mode(pin, PLATFORM_GPIO_OUTPUT, PLATFORM_GPIO_FLOAT);
+  platform_gpio_write(pin, 0);
+
+  // Send the buffer
+  os_intr_lock();
+  ws2812_write(pin_num[pin], led_buffer, led_buffer_length);
+  os_intr_unlock();
+
+  return 0;
+}
+
+// ws2812_init_buffer
+//  writes the parameter string into the internal led_buffer
+//  realocs memory for new string
+static int ICACHE_FLASH_ATTR ws2812_init_buffer(lua_State *L)
+{
+    const char *buffer = luaL_checklstring(L, 1, &led_buffer_length);
+
+    if(led_buffer)
+    {
+        led_buffer = (uint8_t*)os_realloc(led_buffer, led_buffer_length);
+    }
+    else
+    {
+        led_buffer = (uint8_t*)os_malloc(led_buffer_length * sizeof(uint8_t));
+    }
+
+    memcpy(led_buffer, buffer, led_buffer_length);
+    return 0;
+}
+
+
 #define MIN_OPT_LEVEL 2
 #include "lrodefs.h"
 const LUA_REG_TYPE ws2812_map[] =
 {
   { LSTRKEY( "writergb" ), LFUNCVAL( ws2812_writergb )},
   { LSTRKEY( "write" ), LFUNCVAL( ws2812_writegrb )},
+  // new
+  { LSTRKEY( "write_buffer" ), LFUNCVAL( ws2812_write_buffer )},
+  { LSTRKEY( "set_led" ), LFUNCVAL( ws2812_set_led )},
+  { LSTRKEY( "set_leds" ), LFUNCVAL( ws2812_set_leds )},
+  { LSTRKEY( "move_left" ), LFUNCVAL( ws2812_move_left )},
+  { LSTRKEY( "move_right" ), LFUNCVAL( ws2812_move_right )},
+  { LSTRKEY( "init_buffer" ), LFUNCVAL( ws2812_init_buffer )},
+
+  // end
   { LNILKEY, LNILVAL}
 };
 
