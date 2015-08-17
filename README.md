@@ -477,6 +477,12 @@ In contrast to the source code based inclusion of XBMs into u8glib, it's require
 	ws2812.writergb(4, string.char(255, 0, 0))
 	-- set the color of 10 LEDs on GPIO0 to blue
 	ws2812.writergb(3, string.char(0, 0, 255):rep(10))
+    -- update the 2nd led to red
+    ws2812.set_led(2, 255,0,0)
+    -- add a little bit green to the 2nd led
+    ws2812.add_led(2, 0,128,0)
+    -- and write the updated buffer to pin 3, bevor this write all changes are only applied to the internal buffer
+    ws2812.write_buffer(3)
 	-- first LED green, second LED white
 	ws2812.writergb(4, string.char(0, 255, 0, 255, 255, 255))
 ```
@@ -506,7 +512,7 @@ cc:post(coap.NON, "coap://192.168.18.100:5683/", "Hello")
 ####cjson
 ```lua
 -- Note that when cjson deal with large content, it may fails a memory allocation, and leaks a bit of memory.
--- so it's better to detect that and schedule a restart. 
+-- so it's better to detect that and schedule a restart.
 --
 -- Translate Lua value to/from JSON
 -- text = cjson.encode(value)

@@ -17,6 +17,9 @@ static inline uint32_t _getCycleCount(void) {
   return cycles;
 }
 
+
+
+
 // This algorithm reads the cpu clock cycles to calculate the correct
 // pulse widths. It works in both 80 and 160 MHz mode.
 // The values for t0h, t1h, ttot have been tweaked and it doesn't get faster than this.
@@ -29,7 +32,7 @@ static void ICACHE_RAM_ATTR ws2812_write(uint8_t pin, uint8_t *pixels, uint32_t 
   uint8_t *p, *end, pixel, mask;
   uint32_t t, t0h, t1h, ttot, c, start_time, pin_mask;
 
-  WRITE_PERI_REG(0x60000914, 0x73); //reset watchdog
+  WRITE_PERI_REG(0x60000914, 0x73); //reset watchdog, just to be sure the device does not reboot if we have long strips
 
   pin_mask = 1 << pin;
   p =  pixels;
@@ -47,10 +50,12 @@ static void ICACHE_RAM_ATTR ws2812_write(uint8_t pin, uint8_t *pixels, uint32_t 
     } else {
         t = t0h;
     }
-    while (((c = _getCycleCount()) - start_time) < ttot); // Wait for the previous bit to finish
+    // Wait for the previous bit to finish, if we need to wait long enough to reset the watchdog timer, reset it. WDT causes restarts with long led strips.
+    while (((c = _getCycleCount()) - start_time) < ttot) if(c - start_time > 10){ WRITE_PERI_REG(0x60000914, 0x73); } ;
     GPIO_REG_WRITE(GPIO_OUT_W1TS_ADDRESS, pin_mask);      // Set pin high
     start_time = c;                                       // Save the start time
-    while (((c = _getCycleCount()) - start_time) < t);    // Wait for high time to finish
+    //  Wait for high time to finish; if we need to wait long enough to reset the watchdog timer, reset it. WDT causes restarts with long led strips.
+    while (((c = _getCycleCount()) - start_time) < t) if(c - start_time > 10){ WRITE_PERI_REG(0x60000914, 0x73); } ;
     GPIO_REG_WRITE(GPIO_OUT_W1TC_ADDRESS, pin_mask);      // Set pin low
     if (!(mask >>= 1)) {                                  // Next bit/byte
       if (p >= end) {
@@ -60,7 +65,7 @@ static void ICACHE_RAM_ATTR ws2812_write(uint8_t pin, uint8_t *pixels, uint32_t 
       mask = 0x80;
     }
   }
-  WRITE_PERI_REG(0x60000914, 0x73); //reset watchdog
+  WRITE_PERI_REG(0x60000914, 0x73); //reset watchdog, just to be sure the device does not reboot if we have long strips
 }
 
 // Lua: ws2812.writergb(pin, "string")
@@ -100,9 +105,20 @@ static int ICACHE_FLASH_ATTR ws2812_writergb(lua_State* L)
   platform_gpio_mode(pin, PLATFORM_GPIO_OUTPUT, PLATFORM_GPIO_FLOAT);
   platform_gpio_write(pin, 0);
 
+  // Save the buffer
+  if(led_buffer)
+  {
+    led_buffer = (uint8_t*)os_realloc(led_buffer, led_buffer_length);
+  }
+  else
+  {
+    led_buffer = (uint8_t*)os_malloc(led_buffer_length * sizeof(uint8_t));
+  }
+  memcpy(led_buffer, buffer, led_buffer_length);
+
   // Send the buffer
   os_intr_lock();
-  ws2812_write(pin_num[pin], (uint8_t*) buffer, length);
+  ws2812_write(pin_num[pin], (uint8_t*) led_buffer, length);
   os_intr_unlock();
 
   c_free(buffer);
@@ -126,23 +142,37 @@ static int ICACHE_FLASH_ATTR ws2812_writegrb(lua_State* L) {
   platform_gpio_mode(pin, PLATFORM_GPIO_OUTPUT, PLATFORM_GPIO_FLOAT);
   platform_gpio_write(pin, 0);
 
+  // Save the buffer
+  if(led_buffer)
+  {
+    led_buffer = (uint8_t*)os_realloc(led_buffer, led_buffer_length);
+  }
+  else
+  {
+    led_buffer = (uint8_t*)os_malloc(led_buffer_length * sizeof(uint8_t));
+  }
+  memcpy(led_buffer, buffer, led_buffer_length);
+
+
   // Send the buffer
   os_intr_lock();
-  ws2812_write(pin_num[pin], (uint8_t*) buffer, length);
+  ws2812_write(pin_num[pin], (uint8_t*) led_buffer, length);
   os_intr_unlock();
 
   return 0;
 }
 
+
 // ws2812_move_right
 //  move the whole data x leds to the right
+// ws2812.move_right(5) updates the internal buffer and moves all leds 5 positions to the right
 static int ICACHE_FLASH_ATTR ws2812_move_right(lua_State *L)
 {
   const size_t led_amount = luaL_checkinteger(L, 1);
 
   if(led_amount < 0)
   {
-      return -1;
+      return 0;
   }
 
   memmove(led_buffer + led_amount*3, led_buffer, led_buffer_length - led_amount*3);
@@ -154,13 +184,14 @@ static int ICACHE_FLASH_ATTR ws2812_move_right(lua_State *L)
 
 // ws2812_move_left
 //  move the whole data x leds to the left
+// ws2812.move_left(5) updates the internal buffer and moves all leds 5 positions to the left
 static int ICACHE_FLASH_ATTR ws2812_move_left(lua_State *L)
 {
   const size_t led_amount = luaL_checkinteger(L, 1);
 
   if(led_amount < 0)
   {
-      return -1;
+      return 0;
   }
 
   memmove(led_buffer, led_buffer + led_amount*3, led_buffer_length - led_amount*3);
@@ -170,23 +201,79 @@ static int ICACHE_FLASH_ATTR ws2812_move_left(lua_State *L)
 }
 
 
-// ws2812_set_leds
+// ws2812_get_led
+//  updates the internal led_buffer at the given position, adds the values to the current values in the buffer
+// ws2812.get_led(0) returns red,green,blue of the first led
+static int ICACHE_FLASH_ATTR ws2812_get_led(lua_State *L)
+{
+  const size_t led = luaL_checkinteger(L, 1);
+
+  if(led*3+3 > led_buffer_length)
+  {
+      return 0;
+  }
+  if(led < 0)
+  {
+      return 0;
+  }
+
+  const uint8_t blue = led_buffer[led*3+0];
+  const uint8_t red = led_buffer[led*3+1];
+  const uint8_t green = led_buffer[led*3+2];
+
+  lua_pushinteger( L, red );
+  lua_pushinteger( L, green );
+  lua_pushinteger( L, blue );
+  return 3;
+}
+
+
+// ws2812_add_led
+//  updates the internal led_buffer at the given position, adds the values to the current values in the buffer
+// ws2812.add_led(0, 128,0,0) binary or the value of the first led with the given rgb values. in this case the first led would become more red (if not already red)
+static int ICACHE_FLASH_ATTR ws2812_add_led(lua_State *L)
+{
+  const size_t led = luaL_checkinteger(L, 1);
+
+  if(led*3+3 > led_buffer_length)
+  {
+      return 0;
+  }
+  if(led < 0)
+  {
+      return 0;
+  }
+
+  const uint8_t red = luaL_checkinteger(L, 2);
+  const uint8_t green = luaL_checkinteger(L, 3);
+  const uint8_t blue = luaL_checkinteger(L, 4);
+
+  led_buffer[led*3+0] |= blue;
+  led_buffer[led*3+1] |= red;
+  led_buffer[led*3+2] |= green;
+
+  return 0;
+}
+
+// ws2812_add_leds
 //  updates the internal led_buffer at the given position
-//  the parameter at 2nd position is a string which is copyed into the internal led_buffer
+//  the parameter at 2nd position is a string which is added to the current values in the internal led_buffer
 //  usefull to update more than one led
-static int ICACHE_FLASH_ATTR ws2812_set_leds(lua_State *L)
+// ws2812.add_leds(0, string.char(128,0,0)) same als add_led but takes a lua string with multiple values for more than one led (it is not rgb its grb like always)
+static int ICACHE_FLASH_ATTR ws2812_add_leds(lua_State *L)
 {
   const size_t led_pos = luaL_checkinteger(L, 1);
   size_t length;
-  const char *rgb = luaL_checklstring(L, 2, &length);
+  const char *brg = luaL_checklstring(L, 2, &length);
+  int i;
 
-  if(led_pos >= led_buffer_length)
+  if(led_pos*3 > led_buffer_length)
   {
-      return -1;
+      return 0;
   }
   if(led_pos < 0)
   {
-      return -1;
+      return 0;
   }
 
   // cutof the string if we reach the end of the buffer
@@ -195,39 +282,77 @@ static int ICACHE_FLASH_ATTR ws2812_set_leds(lua_State *L)
       length = led_buffer_length - led_pos;
   }
 
-  memcpy(led_buffer + led_pos*3, rgb, length);
+  for(i = 0; i < length ; i++)
+  {
+      led_buffer[led_pos*3 + i] |= brg[i];
+  }
 
   return 0;
 }
 
 // ws2812_set_led
 //  updates the internal led_buffer at the given position
-static int ICACHE_FLASH_ATTR ws2812_set_led(lua_State *L)
+// ws2812.set_led(0, 128,0,0) updates the value of the first led to 128 red
+static int ICACHE_FLASH_ATTR ws2812_set_ledrgb(lua_State *L)
 {
   const size_t led = luaL_checkinteger(L, 1);
 
-  if(led >= led_buffer_length)
+  if(led*3+3 > led_buffer_length)
   {
-      return -1;
+      return 0;
   }
   if(led < 0)
   {
-      return -1;
+      return 0;
   }
 
   const uint8_t red = luaL_checkinteger(L, 2);
   const uint8_t green = luaL_checkinteger(L, 3);
   const uint8_t blue = luaL_checkinteger(L, 4);
 
-  led_buffer[led*3+0] = green;
+  led_buffer[led*3+0] = blue;
   led_buffer[led*3+1] = red;
-  led_buffer[led*3+2] = blue;
+  led_buffer[led*3+2] = green;
 
   return 0;
 }
 
+// ws2812_set_leds
+//  updates the internal led_buffer at the given position
+//  the parameter at 2nd position is a string which is copyed into the internal led_buffer
+//  usefull to update more than one led
+//  (blue, red, green)
+// ws2812.set_leds(0, string.char(128,0,0)) like set_led but takes a lua string for multiple led values. and it is not rgb its is grb
+static int ICACHE_FLASH_ATTR ws2812_set_ledsbrg(lua_State *L)
+{
+  const size_t led_pos = luaL_checkinteger(L, 1);
+  size_t length;
+  const char *brg = luaL_checklstring(L, 2, &length);
+
+  if(led_pos*3 > led_buffer_length)
+  {
+      return 0;
+  }
+  if(led_pos < 0)
+  {
+      return 0;
+  }
+
+  // cutof the string if we reach the end of the buffer
+  if(length + led_pos > led_buffer_length)
+  {
+      length = led_buffer_length - led_pos;
+  }
+
+  memcpy(led_buffer + led_pos*3, brg, length);
+
+  return 0;
+}
+
+
 // ws2812_write_buffer
 //  writes out the internal led_buffer to the pin parsed as first parameter
+// ws2812.write_buffer(4) writes the values of the internal buffer to the led strip connected at pin 4
 static int ICACHE_FLASH_ATTR ws2812_write_buffer(lua_State *L)
 {
   const uint8_t pin = luaL_checkinteger(L, 1);
@@ -240,28 +365,7 @@ static int ICACHE_FLASH_ATTR ws2812_write_buffer(lua_State *L)
   os_intr_lock();
   ws2812_write(pin_num[pin], led_buffer, led_buffer_length);
   os_intr_unlock();
-
   return 0;
-}
-
-// ws2812_init_buffer
-//  writes the parameter string into the internal led_buffer
-//  realocs memory for new string
-static int ICACHE_FLASH_ATTR ws2812_init_buffer(lua_State *L)
-{
-    const char *buffer = luaL_checklstring(L, 1, &led_buffer_length);
-
-    if(led_buffer)
-    {
-        led_buffer = (uint8_t*)os_realloc(led_buffer, led_buffer_length);
-    }
-    else
-    {
-        led_buffer = (uint8_t*)os_malloc(led_buffer_length * sizeof(uint8_t));
-    }
-
-    memcpy(led_buffer, buffer, led_buffer_length);
-    return 0;
 }
 
 
@@ -273,11 +377,19 @@ const LUA_REG_TYPE ws2812_map[] =
   { LSTRKEY( "write" ), LFUNCVAL( ws2812_writegrb )},
   // new
   { LSTRKEY( "write_buffer" ), LFUNCVAL( ws2812_write_buffer )},
-  { LSTRKEY( "set_led" ), LFUNCVAL( ws2812_set_led )},
-  { LSTRKEY( "set_leds" ), LFUNCVAL( ws2812_set_leds )},
+  { LSTRKEY( "get_led" ), LFUNCVAL( ws2812_get_led )},
+  { LSTRKEY( "add_led" ), LFUNCVAL( ws2812_add_led )},
+  { LSTRKEY( "add_leds" ), LFUNCVAL( ws2812_add_leds )},
+  { LSTRKEY( "set_led" ), LFUNCVAL( ws2812_set_ledrgb )},
+  { LSTRKEY( "set_leds" ), LFUNCVAL( ws2812_set_ledsbrg )},
   { LSTRKEY( "move_left" ), LFUNCVAL( ws2812_move_left )},
   { LSTRKEY( "move_right" ), LFUNCVAL( ws2812_move_right )},
-  { LSTRKEY( "init_buffer" ), LFUNCVAL( ws2812_init_buffer )},
+#ifdef UART_TEST
+  // uart
+  { LSTRKEY( "uart_append_color" ), LFUNCVAL( ws28xx_color )},
+  { LSTRKEY( "uart_fill_fifo" ), LFUNCVAL( fill_fifo )},
+  { LSTRKEY( "uart_init" ), LFUNCVAL( ws28xx_init )},
+#endif
 
   // end
   { LNILKEY, LNILVAL}
